@@ -1,0 +1,6 @@
+langgraph
+langchain
+langchain_aws
+gradio
+gradio[oauth]
+ddgs

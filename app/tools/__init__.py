@@ -1,5 +1,6 @@
-from .currency_tool import get_exchange_rate
+from .currency_tool import convert_currency
 from .receipt_recognition_tool import extract_text
+from .web_search_tool import SearchTool
 from .database_tool import (
     add_expense,
     get_expense,

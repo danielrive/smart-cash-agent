@@ -30,24 +30,25 @@ def configure_logger():
     if not root.handlers:
         root.addHandler(handler)
 
-configure_logger()
-logger = logging.getLogger(__name__)
+#configure_logger()
+#logger = logging.getLogger(__name__)
 
 
 
 def run():
-    from app.agent.graph import graph
+    from app.agent.agent import graph
     from langchain_core.messages import HumanMessage
 
     #state = {"messages": [HumanMessage(content="i will buy a present for my mom, i want to register this in my expense app, my local currency is COP but i am buying this in united states, the price is 1000 dollars and this is a bike for my mom")]}
-    state = {"messages": [HumanMessage(content="I needed to go wiht my pet to the doctor, here the receipt")],"input_file": "./samples/receipt1.jpg" }
-    logger.info("Graph invoked with state: %s", state)
+    state = {"messages": [HumanMessage(content="Who did the actor who played Ray in the Polish-language version of Everybody Loves Raymond play in Magda M.? Give only the first name.")]}
+    #state = {"messages": [HumanMessage(content="I needed to go wiht my pet to the doctor, here the receipt")],"input_file": "./samples/receipt1.jpg" }
+    #logger.info("Graph invoked with state: %s", state)
     try:
         result = graph.invoke(state)
-        logger.info("Graph completed, result %s", result)
+        #logger.info("Graph completed, result %s", result)
         print(result["messages"][-1].content)
     except Exception:
-        logger.error("Error in graph execution", exc_info=True)
+        #logger.error("Error in graph execution", exc_info=True)
         raise
 
 if __name__ == "__main__":
