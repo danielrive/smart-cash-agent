@@ -9,10 +9,20 @@ from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field,field_validator
 from app.agent.state import AgentState, AgentStep  # Ensure this supports messages: Annotated[list[BaseMessage], add_messages]
+import logging
 
 # Tools
 from app.tools import SearchTool
 from app.tools.currency_tool import convert_currency
+
+
+
+logging.basicConfig(
+    level=logging.INFO,  # use INFO or WARNING in production
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+)
+
+logger = logging.getLogger(__name__)
 
 # Define the LLM
 llm = init_chat_model(
@@ -48,6 +58,7 @@ REASON: <brief explanation>
 """)
 
 def init_agent_state(question: str) -> AgentState:
+    logger.info(f"Initializing agent state for question: {question}")
     return AgentState(
         question=question,
         messages=[],
@@ -57,7 +68,8 @@ def init_agent_state(question: str) -> AgentState:
         input_file=None,
         question_type="",
         redefined_question="",
-        reason=""
+        reason="",
+        last_tool_results=[]
     )
 
 # Tools
@@ -76,7 +88,7 @@ llm_with_tools = llm.bind_tools(tools)
 
 # Pydantic Model for Structured Output
 class AnalysisOutput(BaseModel):
-    question_type: str = Field(..., enum=["factual", "statistical", "comparative", "causal", "direct_answer"])
+    question_type: Literal["factual", "statistical", "comparative", "causal", "direct_answer"]
     selected_tools: list[str] = Field(..., enum=["web_search", "currency_converter"])
     redefined_question: str
     reason: str
@@ -90,6 +102,7 @@ class AnalysisOutput(BaseModel):
 def analyze_question_node(state: AgentState) -> AgentState:
     """Analyze the question to determine next steps."""
     try:
+        logger.info(f"Analyzing question: {state['question']}")
         analysis_response = analysis_prompt | llm.with_structured_output(AnalysisOutput) 
         results = analysis_response.invoke({"question": state["question"]})
 
@@ -101,6 +114,7 @@ def analyze_question_node(state: AgentState) -> AgentState:
         state["current_step"] = AgentStep.SELECT_TOOLS.value
     
     except Exception as e:
+        logger.exception("Error during analysis")
         state["messages"].append(AIMessage(content=f"Error during analysis: {str(e)}"))
         state["current_step"] = AgentStep.ERROR_RECOVERY.value
 
@@ -110,11 +124,12 @@ def analyze_question_node(state: AgentState) -> AgentState:
 
 def select_tools_node(state: AgentState) -> AgentState:
     """Select tools based on the analysis."""
-    state["current_step"] = AgentStep.SELECT_TOOLS.value
+    state["current_step"] = AgentStep.EXECUTE_TOOLS.value
     if state["selected_tools"]:
         state["messages"].append(AIMessage(content=f"Selected tools: {', '.join(state['selected_tools'])} for query: {state['redefined_question']}"))
     else:
         state["messages"].append(AIMessage(content="No tools needed; proceeding to synthesis."))
+
     return state
     
 
@@ -133,7 +148,7 @@ def execute_tools_node(state: AgentState) -> AgentState:
                     "name": "web_search",
                     "args": {"query": state["redefined_question"]},
                     "id": f"call_{tool_name}",
-                    "type": "tool"
+                    "type": "tool_call"
                 })
             elif tool_name == "currency_converter":
                 # Parse currency query (simplified; improve for robustness)
@@ -145,23 +160,99 @@ def execute_tools_node(state: AgentState) -> AgentState:
                         "name": "currency_converter",
                         "args": {"amount": amount, "from_currency": from_curr, "to_currency": to_curr},
                         "id": f"call_{tool_name}",
-                        "type": "tool"
+                        "type": "tool_call"
                     })
-        
+        if not tool_calls:
+            logger.info("No tool calls to execute.")
+            return state
+
         # Execute tools
-        tool_results = tool_node.invoke({"messages": state["messages"] + [AIMessage(tool_calls=tool_calls,content="")]})
-        state["messages"].extend(tool_results["messages"])
+        ai_tool_message = AIMessage(content="", tool_calls=tool_calls)
+        tool_results = tool_node.invoke({"messages": state["messages"] + [ai_tool_message]})
+
+        new_tool_messages = [
+            m for m in tool_results["messages"] if isinstance(m, ToolMessage)
+        ]
+
+        logger.info(f"Executed {len(new_tool_messages)} tools: {[m.name for m in new_tool_messages]}")
+        
+        state["last_tool_results"] = [m.content for m in new_tool_messages]
+        # Append results to state
+        state["messages"].extend(new_tool_messages)
         
     except Exception as e:
+        logger.exception("Error executing tools")
         state["messages"].append(ToolMessage(content=f"Tool execution error: {e}", tool_call_id="error", name="error"))
         state["reason"] += f" (Tool error: {e})"
     
     return state
 
 def synthesize_answer_node(state: AgentState) -> AgentState:
-    """Placeholder for synthesis (AgentStep.SYNTHESIZE_ANSWER)."""
+    """Synthesize answer from tool results (AgentStep.SYNTHESIZE_ANSWER)."""
     state["current_step"] = AgentStep.SYNTHESIZE_ANSWER.value
-    state["messages"].append(AIMessage(content="Synthesizing answer from analysis (placeholder)."))
+    logger.info("Synthesizing answer")
+    try:
+        # Enhanced prompt for synthesis
+        synthesis_prompt = ChatPromptTemplate.from_messages([
+            ("system", """
+You are a precise assistant. Based on the question and tool results, provide a concise answer.
+- For numeric questions (question_type: statistical or factual), extract ONLY the number (e.g., `95`).
+- For other types, provide a brief answer or call additional tools if needed.
+- If tool results are insufficient, request more tool calls (e.g., refine web_search query).
+- Do not include reasoning or explanations in the final answer unless requested.
+- Question: {question}
+- Query Type: {question_type}
+- Tool Results: {tool_results}
+"""),
+            MessagesPlaceholder("messages"),
+        ])
+        
+        # Extract tool results for prompt
+        tool_results = "\n".join(state.get("last_tool_results", []))
+        
+        synthesis_chain = synthesis_prompt | llm_with_tools
+        response = synthesis_chain.invoke({
+            "question": state["question"],
+            "question_type": state["question_type"],
+            "tool_results": tool_results,
+            "messages": state["messages"],
+        })
+        
+        if response.tool_calls:
+            # Additional tool calls requested
+            logger.info("Additional tool calls requested")
+            state["messages"].append(AIMessage(content="", tool_calls=response.tool_calls))
+            state["selected_tools"] = [call["name"] for call in response.tool_calls]
+            state["redefined_question"] = response.tool_calls[0]["args"].get("question", state["redefined_question"])  # Update if new query
+            state["reason"] = state.get("reason", "") + " (Additional tool calls requested)"
+        else:
+            # Extract number for statistical/factual queries
+            answer = response.content
+            if state["question_type"] in ["statistical", "factual"]:
+                match = re.search(r'\b(\d+)\b', answer)
+                answer = match.group(1) if match else answer
+            state["final_answer"] = answer
+            state["messages"].append(AIMessage(content=f"Synthesized answer: {answer}"))
+            logger.info("Final answer synthesized")
+    
+    except Exception as e:
+        state["messages"].append(AIMessage(content=f"Synthesis error: {e}"))
+        state["final_answer"] = "Error occurred during synthesis."
+        state["reason"] = state.get("reason", "") + f" (Synthesis error: {e})"
+        logger.exception("Synthesis error")
+    
+    return state
+
+def complete_node(state: AgentState) -> AgentState:
+    """Format final answer (AgentStep.COMPLETE)."""
+    state["current_step"] = AgentStep.COMPLETE.value
+    
+    # Ensure numeric output for statistical/factual queries
+    if state["question_type"] in ["statistical", "factual"] and state["final_answer"]:
+        match = re.search(r'\b(\d+)\b', state["final_answer"])
+        if match:
+            state["final_answer"] = match.group(1)  # e.g., "95"
+    state["messages"].append(AIMessage(content=f"Final answer: {state['final_answer']}"))
     return state
 
 ### Routes
@@ -202,9 +293,18 @@ graph = graph_builder.compile()
 def run_agent(question: str) -> AgentState:
     state = init_agent_state(question)
     result = graph.invoke(state)
+
     print("Result State:", result)
     print(f"Question Type: {result['question_type']}")
+    print(f"Reason: {result['reason']}")
     print(f"Selected Tools: {result['selected_tools']}")
     print(f"Refined Question: {result['redefined_question']}")
     print(f"Messages: {[m.content for m in result['messages']]}")
+    print(f"Final Answer: {result['final_answer']}")
     return result
+
+def draw_graph():
+    from IPython.display import Image, display
+    from langchain_core.runnables.graph import MermaidDrawMethod
+
+    display(Image(graph.get_graph().draw_mermaid_png()))

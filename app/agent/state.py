@@ -13,6 +13,7 @@ class AgentState(TypedDict):
     final_answer: str
     input_file: Optional[str] # Contains file path to image
     reason: str  # Reason for the selected tool
+    last_tool_results: str
 
 
 class AgentStep(Enum):
