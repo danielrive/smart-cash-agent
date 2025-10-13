@@ -14,6 +14,7 @@ class AgentState(TypedDict):
     input_file: Optional[str] # Contains file path to image
     reason: str  # Reason for the selected tool
     last_tool_results: str
+    tool_loop_count: int
 
 
 class AgentStep(Enum):
