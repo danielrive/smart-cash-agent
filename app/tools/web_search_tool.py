@@ -2,8 +2,8 @@ import json
 import spacy
 import logging
 from typing import List, Dict
-from langchain.utilities import WikipediaAPIWrapper, DuckDuckGoSearchAPIWrapper
-from langchain_community.tools import DuckDuckGoSearchResults
+
+from langchain_community.utilities import WikipediaAPIWrapper
 from langchain_community.document_loaders import UnstructuredURLLoader
 
 # Module-level logger
@@ -11,21 +11,23 @@ logger = logging.getLogger(__name__)
 
 
 class SearchTool:
-    """Search tool with question classification and optimization."""
-    logger.info("Initializing SearchTool...")
-    def __init__(self, max_results: int = 10,fetch_top_n: int = 3, max_chars: int = 5000):
-        self.search_wrapper = DuckDuckGoSearchAPIWrapper(max_results=max_results)
-        self.base_tool = DuckDuckGoSearchResults(api_wrapper=self.search_wrapper, output_format="json")
-
+    """Wikipedia search tool optimized for GAIA benchmark questions."""
+    def __init__(self, max_results: int = 10, fetch_top_n: int = 3, max_chars: int = 5000):
+        logger.info("Initializing SearchTool (Wikipedia-only)...")
+        
         self.wiki_wrapper = WikipediaAPIWrapper(
             top_k_results=3,
             doc_content_chars_max=3000,
             load_all_available_meta=True,
         )
 
-        self.nlp = spacy.load("en_core_web_sm")  # Lightweight NLP model
-        self.max_results = max_results
-
+        # Load spacy model with error handling
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            logger.error("Spacy model 'en_core_web_sm' not found. Run: python -m spacy download en_core_web_sm")
+            raise
+        
         # Config
         self.max_results = max_results
         self.fetch_top_n = fetch_top_n
@@ -48,33 +50,39 @@ class SearchTool:
 
     def _rank_results(self, results: List[Dict], key_terms: List[str]) -> List[Dict]:
         """Rank results by keyword overlap and source quality."""
-        logger.debug("IN Ranking results")
-        logger.debug(f"IN RANK RESULT FUNCTION RAW Results: {results}")
+        logger.debug("Ranking results...")
+        logger.debug(f"Input: {len(results)} results, {len(key_terms)} key terms")
 
         if not results:
             return []
+        
         seen_snippets = set()
         scored = []
         key_terms_lower = [t.lower() for t in key_terms]
-        threshold = max(1, len(key_terms_lower) // 2)  
+        threshold = max(1, len(key_terms_lower) // 2)
+        logger.debug(f"Ranking threshold: {threshold}")
 
         for r in results:
             snippet = (r.get("snippet", "") + " " + r.get("title", "")).lower()
             if snippet in seen_snippets:
                 continue
             seen_snippets.add(snippet)
-            logger.debug(f"Scoring snippet: {snippet}")
+            
+            # Score by keyword overlap
             score = sum(snippet.count(term) for term in key_terms_lower)
-            logger.debug(f"Score: {score}")
+            
+            # Penalize very short snippets
             if len(snippet) < 20:
                 score -= 1
 
             if score >= threshold:
                 scored.append((score, r))
+                logger.debug(f"Result scored {score}: {r.get('title', 'No title')[:50]}")
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        logger.debug(f"IN RANK FUNCTION Scored results: {[scored]}")
-        logger.debug(f"IN RANK FUNCTION tittles: {[r['title'] for score, r in scored]}")
+        logger.info(f"Ranked {len(scored)} results (from {len(results)} total)")
+        if scored:
+            logger.debug(f"Top result: {scored[0][1].get('title', 'No title')}")
         return [r for score, r in scored]
 
     def _fetch_full_content(self, urls: List[str]) -> Dict[str, str]:
@@ -104,19 +112,23 @@ class SearchTool:
         return url_to_content
 
     def _search_wikipedia(self, question: str) -> List[Dict]:
-        
-        spicy_doc = self.nlp(question)
+        """Search Wikipedia with entity extraction for better results."""
+        spacy_doc = self.nlp(question)
 
-        # Step 1: Extract named entities (PERSON, ORG, GPE, WORK_OF_ART, EVENT, etc.)
-        entities = [ent.text for ent in spicy_doc.ents if ent.label_ in [
+        # Extract named entities (PERSON, ORG, GPE, WORK_OF_ART, EVENT, etc.)
+        entities = [ent.text for ent in spacy_doc.ents if ent.label_ in [
             "PERSON", "ORG", "GPE", "LOC", "WORK_OF_ART", "EVENT"
         ]]
         logger.debug(f"Named entities extracted: {entities}")
-        if entities:
-            question = " ".join(entities)  # Use entities as the question for Wikipedia search
+        
+        # Use entities as search terms if found, otherwise use full question
+        search_query = " ".join(entities) if entities else question
+        logger.info(f"Wikipedia search query: {search_query}")
+        
         try:
-            docs = self.wiki_wrapper.load(question)  # returns multiple docs
-            logger.debug(f"Wikipedia RAW search results: {docs}")
+            docs = self.wiki_wrapper.load(search_query)
+            logger.info(f"Wikipedia returned {len(docs)} documents")
+            
             results = []
             for d in docs:
                 content = d.page_content[:500]  # trim to avoid overflow
@@ -126,52 +138,40 @@ class SearchTool:
                     "link": d.metadata.get("source", ""),
                     "content": content
                 })
+            logger.debug(f"Wikipedia titles: {[r['title'] for r in results]}")
             return results
-        except Exception:
-            logger.warning("Wikipedia search failed")
+        except Exception as e:
+            logger.warning(f"Wikipedia search failed: {str(e)}")
             return []
 
-    def run(self, question: str, question_type: str) -> str:
-        logger.info("Running SearchTool")
-
-        logger.info(f"Searching for: {question}")
+    def run(self, question: str, question_type: str = "factual") -> str:
+        """
+        Search Wikipedia for information to answer the question.
+        
+        Args:
+            question: The search question
+            question_type: Type of question (kept for compatibility, always uses Wikipedia)
+        
+        Returns:
+            JSON string with search results from Wikipedia
+        """
+        logger.info(f"Running SearchTool with question_type: {question_type}")
+        logger.info(f"Question: {question[:100]}...")
         
         key_terms = self._extract_key_terms(question)
-        all_results = []
-
-        if question_type == "testfactual":
-            try:
-                search_terms = " ".join(key_terms)
-                logger.info(f"Searching Wikipedia for: {search_terms}")
-                wiki_results = self._search_wikipedia(search_terms)
-                logger.info(f"Wikipedia search results titles: {[r['title'] for r in wiki_results]}")
-                logger.debug(f"RAW Wikipedia search results: {wiki_results}")
-                all_results.extend(wiki_results)
-            except Exception:
-                logger.exception("Wikipedia search failed") 
-
-        else:
-            try:
-                results_raw = self.base_tool.invoke(question)
-                
-                logger.debug(f"Raw results: {results_raw}")
-
-                if isinstance(results_raw, str):
-                    try:
-                        results = json.loads(results_raw)
-                    except json.JSONDecodeError:
-                        logger.exception("Failed to parse results for question")
-                        results = []
-                    
-                elif isinstance(results_raw, list):
-                        results = results_raw
-                else:
-                    results = []
-
-                all_results.extend(results if isinstance(results, list) else [])
-
-            except Exception:
-                logger.exception("Web search failed")
+        logger.debug(f"Key terms: {key_terms}")
+        
+        # Search Wikipedia
+        try:
+            search_terms = " ".join(key_terms)
+            logger.info(f"Searching Wikipedia with terms: {search_terms}")
+            all_results = self._search_wikipedia(search_terms)
+            logger.info(f"Wikipedia returned {len(all_results)} results")
+            if all_results:
+                logger.debug(f"Wikipedia titles: {[r['title'] for r in all_results]}")
+        except Exception:
+            logger.exception("Wikipedia search failed")
+            all_results = []
 
         if not all_results:
             logger.warning("No search results found")
@@ -204,14 +204,17 @@ class SearchTool:
             for r in ranked[: self.max_results]
         ]
         
-        logger.debug(f"SearchTool ranked results: {top_results}")
-        #Fetch full content for top N
-
-        urls = [r["link"] for r in top_results[: self.fetch_top_n]]
-        content_map = self._fetch_full_content(urls)
-
-        for r in top_results:
-            if r["link"] in content_map:
-                r["content"] = content_map[r["link"]]
-        logger.debug(f"SearchTool results: {top_results}")
+        logger.info(f"Returning top {len(top_results)} ranked results")
+        
+        # Fetch full content for top N URLs
+        urls = [r["link"] for r in top_results[: self.fetch_top_n] if r.get("link")]
+        if urls:
+            logger.info(f"Fetching full content from {len(urls)} URLs")
+            content_map = self._fetch_full_content(urls)
+            
+            for r in top_results:
+                if r["link"] in content_map:
+                    r["content"] = content_map[r["link"]]
+        
+        logger.info(f"Search complete. Returning {len(top_results)} results")
         return json.dumps(top_results, indent=2)
